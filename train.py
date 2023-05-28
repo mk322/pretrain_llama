@@ -13,6 +13,7 @@ import tqdm
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 from preprocess_data import load_data
 #from lit_llama.utils import save_model_checkpoint
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def setup_model_parallel():
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -48,7 +49,8 @@ out_dir = "out/training"
 eval_interval = 20
 
 # Initialize the tokenizer
-tokenizer = AutoTokenizer.from_pretrained('gpt2')
+tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
+tokenizer.pad_token = "<unk>"
 
 # Load the dataset
 train_data, valid_data, test_data = load_data()
@@ -114,9 +116,10 @@ def train(
         t0 = time.time()
         for i, batch in enumerate(train_data):
             input_ids = torch.stack(batch['input_ids'], dim=0)
-            fabric.to_device((input_ids.pin_memory()))
+            #attention_mask = torch.stack(batch['attention_mask'], dim=0)
+            input_ids = fabric.to_device((input_ids.pin_memory()))
 
-        logits = model(input_ids)
+        logits = model(input_ids, 0)
         loss = logits[0]
         #loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
