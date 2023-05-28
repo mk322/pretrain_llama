@@ -76,12 +76,6 @@ optimizer = fabric.setup_optimizers(optimizer)
 #model.to(device)
 #print(device)
 
-# If multiple GPUs are available, use them
-#if torch.cuda.device_count() > 1:
-    #print("Let's use", torch.cuda.device_count(), "GPUs!")
-    #model = nn.DataParallel(model)
-    #model = model.to(device)
-
 # Initialize weights
 def initialize_weights(m):
 
@@ -91,7 +85,7 @@ def initialize_weights(m):
         m.weight.requires_grad = True
         m.bias.requires_grad = True
     elif isinstance(m, nn.Embedding):
-        torch.nn.init.normal_(m.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
+        torch.nn.init.normal_(m.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
 
 def validate(model, validation_dataset):
     validation_loss = 0
