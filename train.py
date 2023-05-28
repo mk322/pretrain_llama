@@ -1,15 +1,18 @@
 import torch
+from torch.autograd import Variable
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 import lightning as L
 from lightning.fabric.strategies import FSDPStrategy
 from functools import partial
+torch.set_float32_matmul_precision('high')
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from model import Transformer, ModelArgs, TransformerBlock  # Assuming model.py is in the same directory
 import os
 import time
 import tqdm
+import math
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 from preprocess_data import load_data
 #from lit_llama.utils import save_model_checkpoint
@@ -36,21 +39,27 @@ fabric = L.Fabric(accelerator="cuda", devices=2, precision="bf16-mixed", strateg
 fabric.launch()
 fabric.seed_everything(1337 + fabric.global_rank)
 
-#with fabric.device:
-model_args = fabric.to_device(ModelArgs(dim=4096, n_layers=2, n_heads=2, vocab_size=320))  # Update these parameters as needed
-model = fabric.to_device(Transformer(model_args))
+# Initialize the tokenizer
+tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b", fast=False)
+tokenizer.pad_token = "<unk>"
 
-model = fabric.setup_module(model)
 
+dim = 2048
+n_heads = 2
+n_layers = 2
+vocab_size = 32000
 epochs = 1
 log_interval = 1
 max_iters = 10
 out_dir = "out/training"
 eval_interval = 20
 
-# Initialize the tokenizer
-tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
-tokenizer.pad_token = "<unk>"
+#with fabric.device:
+model_args = fabric.to_device(ModelArgs(dim=2048, n_layers=n_layers, n_heads=n_heads, vocab_size=32000))  # Update these parameters as needed
+model = fabric.to_device(Transformer(model_args))
+
+model = fabric.setup_module(model)
+
 
 # Load the dataset
 train_data, valid_data, test_data = load_data()
@@ -75,9 +84,14 @@ optimizer = fabric.setup_optimizers(optimizer)
 
 # Initialize weights
 def initialize_weights(m):
+
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
+        m.weight.requires_grad = True
+        m.bias.requires_grad = True
+    elif isinstance(m, nn.Embedding):
+        torch.nn.init.normal_(m.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
 
 def validate(model, validation_dataset):
     validation_loss = 0
@@ -89,9 +103,11 @@ def validate(model, validation_dataset):
             validation_loss += outputs.loss.item()
     return validation_loss / len(validation_dataset)
 
-print("start_init")
+#print("start_init")
 model.apply(initialize_weights)
-print("end_init")
+for param in model.parameters():
+    param.requires_grad = True
+#print("end_init")
 
 
 
@@ -105,7 +121,7 @@ def train(
 
     while True:
         # TODO: add learning rate scheduling
-
+        model.train()
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num > 0 and iter_num % eval_interval == 0:
             val_loss = validate(fabric, model, val_data)
@@ -114,31 +130,32 @@ def train(
             #save_model_checkpoint(fabric, model, os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"))
 
         t0 = time.time()
+        #print(train_data)
         for i, batch in enumerate(train_data):
-            input_ids = torch.stack(batch['input_ids'], dim=0)
-            #attention_mask = torch.stack(batch['attention_mask'], dim=0)
-            input_ids = fabric.to_device((input_ids.pin_memory()))
 
-        logits = model(input_ids, 0)
-        loss = logits[0]
-        #loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = model(fabric.to_device(batch["input_ids"]), 0)
+            labels = fabric.to_device(batch["labels"])
 
-        fabric.backward(loss)
+            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = Variable(loss, requires_grad = True)
+            fabric.backward(loss)
 
         # TODO: Gradient clipping
         # if grad_clip != 0.0:
         #     fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
 
-        optimizer.step()
-        optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
 
-        dt = time.time() - t0
-        if iter_num % log_interval == 0:
-            fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
-        iter_num += 1
+            dt = time.time() - t0
+            if iter_num % log_interval == 0:
+                fabric.print(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
+            iter_num += 1
 
-        if iter_num > max_iters:
-            break
+            if iter_num > max_iters:
+                break
+
+            print("succc!!!")
 
 train(fabric, model, optimizer, train_data, valid_data)
 
