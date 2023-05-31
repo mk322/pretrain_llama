@@ -234,5 +234,6 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
+        # [batch_size, sequence_length, hidden_size]
         output = self.output(h[:, :, :])  # only compute last logits
         return output.float()
