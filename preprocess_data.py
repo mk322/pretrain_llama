@@ -15,7 +15,7 @@ tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
 tokenizer.pad_token = "<unk>"
 
 def encode(examples):
-    return tokenizer(examples['text'], truncation=True, max_length=512, padding='max_length')
+    return tokenizer(examples['text'], truncation=True, max_length=513, padding='max_length')
 
 def load_data(batch_size=128, num_train=100000):
     # load shuffled train, validation and test sets 
@@ -39,7 +39,7 @@ def load_data(batch_size=128, num_train=100000):
     def collate_fn(data):
         #print(data[0]['input_ids'][:-1])
         input_ids = torch.stack([torch.IntTensor(item['input_ids'][:-1]) for item in data], dim=0)
-        labels = torch.stack([torch.IntTensor(item['input_ids'][1:]) for item in data], dim=0)
+        labels = torch.stack([torch.LongTensor(item['input_ids'][1:]) for item in data], dim=0)
         return input_ids, labels
     train = train.with_format("torch")
     validation = validation.with_format("torch")

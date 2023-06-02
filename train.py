@@ -7,6 +7,7 @@ import lightning as L
 import numpy as np
 from lightning.fabric.strategies import FSDPStrategy
 from functools import partial
+from sophia import SophiaG
 torch.set_float32_matmul_precision('high')
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from model import Transformer, ModelArgs, TransformerBlock  # Assuming model.py is in the same directory
@@ -20,72 +21,86 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from datetime import datetime
 import argparse
+import numpy as np
 
-os.environ['OMP_NUM_THREADS'] = '4'
-out_dir = "true_out/training"
+os.environ["OMP_NUM_THREADS"] = "2"
 dim = 2048
 n_heads = 4
 n_layers = 4
 vocab_size = 32000
-log_interval = 25
-training_sample = 30000
+log_interval = 20
+training_sample = 10000
+num_epochs = 10
 
 # Hyperparameters
-learning_rate = 1e-2
+learning_rate = 6e-4
 batch_size = 64
 max_iters = 100
 weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
+beta1 = 0.95
+beta2 = 0.9
 grad_clip = 1.0
+rho = 0.1
 
 # Load the dataset
 train_data, valid_data, test_data, train_len, validation_len = load_data(batch_size, training_sample)
 
-def main():
-    m = Model()
+def main(args):
+    path = f"{args.optimizer}_out_2/"
+    path_loss = f"{args.optimizer}_out_2/loss/"
+    path_training = f"{args.optimizer}_out_2/training/"
+    if not os.path.exists(path):
+        os.mkdir(path)
+    if not os.path.exists(path_loss):
+        os.mkdir(path_loss)
+    if not os.path.exists(path_training):
+        os.mkdir(path_training)
+    m = Model(path_training)
     local_rank, world_size = m.setup_model_parallel()
 
     auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={TransformerBlock})
     strategy = FSDPStrategy(auto_wrap_policy=auto_wrap_policy, activation_checkpointing=TransformerBlock)
 
-    fabric = L.Fabric(accelerator="cuda", devices=4, precision="bf16-mixed", strategy=strategy)
+    fabric = L.Fabric(accelerator="cuda", devices=args.num_nodes, precision="bf16-mixed", strategy=strategy)
     #fabric = L.Fabric(accelerator="cuda", devices=2, strategy=strategy)
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)
 
-    # Initialize the tokenizer
-    #tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b", fast=False)
-    #tokenizer.pad_token = "<unk>"
 
-    #with fabric.device:
     model_args = fabric.to_device(ModelArgs(dim=dim, n_layers=n_layers, n_heads=n_heads, vocab_size=vocab_size, max_batch_size=batch_size))  # Update these parameters as needed
     model = fabric.to_device(Transformer(model_args))
-    model = fabric.setup_module(model)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
-    optimizer = fabric.setup_optimizers(optimizer)
 
     # initialize a model/ start from checkpoint
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-l','--load_iter_path', type=str, default="")
-    args = parser.parse_args()
+
     load_file_path = args.load_iter_path
     if load_file_path == "" or load_file_path=="pretrain":
         print("initial weight!!!")
-        model.apply(m.initialize_weights)
+        model.apply(model._init_weights)
+        model = fabric.setup_module(model)
+        if args.optimizer == "sophia":
+            optimizer = SophiaG(model.parameters(), lr=learning_rate, betas=(beta1, beta2), rho = 0.01, weight_decay=weight_decay)
+        elif args.optimizer == "adamw":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
+
+        optimizer = fabric.setup_optimizers(optimizer)
+
+        # Create the learning rate scheduler.
+
     elif not os.path.isfile(load_file_path):
         raise Exception(f'{load_file_path} is not a valid file path')
     else:
-        m.load_model_checkpoint(fabric, model, load_file_path)
-        m.file_cnt += 1
+        model, optimizer, iter = m.load_model_checkpoint(fabric, model, load_file_path, args.optimizer)
+        m.file_cnt = iter
     for param in model.parameters():
         param.requires_grad = True
 
     # save initial weights
     m.save_model_checkpoint(fabric, model, optimizer)
 
-    filename = "true_out/loss/"+str(m.file_cnt)+".txt"
+    total_steps = train_len * (num_epochs-m.iter_num)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    filename = f"{path_loss}"+str(m.file_cnt)+".txt"
     stat_f = open(filename, "w", buffering=1)
 
     # save parameters to file
@@ -105,7 +120,10 @@ def main():
     stat_f.write(f'grad_clip = {grad_clip}\n\n')
 
     print("Start training!")
-    m.train(fabric, model, optimizer, train_data, valid_data, stat_f)
+    if args.optimizer == "sophia":
+        m.train(fabric, model, optimizer, scheduler, train_data, valid_data, stat_f, True)
+    elif args.optimizer == "adamw":
+        m.train(fabric, model, optimizer, scheduler, train_data, valid_data, stat_f, False)
 
     stat_f.close()
     m.file_cnt += 1
@@ -113,9 +131,10 @@ def main():
 
 
 class Model():
-    def __init__(self):
+    def __init__(self, path_training):
         self.file_cnt = 1
         self.iter_num = 0
+        self.path_training = path_training
 
     def setup_model_parallel(self):
         local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -130,21 +149,12 @@ class Model():
         return local_rank, world_size
 
     def save_model_checkpoint(self, fabric, model, optimizer):
-        # if isinstance(fabric.strategy, FSDPStrategy):
-        #     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        #     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        #         state_dict = model._forward_module.state_dict()
-        # else:
-        #     state_dict = model.state_dict()
 
-        # if fabric.global_rank == 0:
-        #     torch.save(state_dict, file_path)
-        # fabric.barrier()
-        file_path = os.path.join(out_dir, f"iter-{self.iter_num:06d}-ckpt.pth")
+        file_path = os.path.join(self.path_training, f"iter-{self.iter_num:06d}-ckpt.pth")
         save_state = {"model": model, "optimizer": optimizer, "iter_num": self.iter_num}
         fabric.save(file_path, save_state)
 
-    def load_model_checkpoint(self, fabric, model, file_path):
+    def load_model_checkpoint(self, fabric, model, file_path, optim="adamw"):
         # if not file_path.is_file():
         #     print(f'model checkpoint {file_path} is not present. Returning...')
         #     return
@@ -153,19 +163,26 @@ class Model():
         # model.load
         # example: "out/training/iter-000004-ckpt.pth"
         index = file_path.find('iter-')
-        self.iter_num = int(file_path[index+5:index+11])
-        fabric.load(file_path)
-        
+        self.iter_num = int(file_path[index+5:index+11])+1
+        checkpoint = fabric.load(file_path)
+        model.load_state_dict(checkpoint["model"])
+        model = fabric.setup_module(model)
+        if optim == "adamw":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
+        elif optim == "sophia":
+            optimizer = SophiaG(model.parameters(), lr=learning_rate, betas=(beta1, beta2), rho = 0.01, weight_decay=weight_decay)
+        else:
+            raise Exception(f'{optim} is not a valid optimizer name, please try adamw or sophia.')
 
-    # Initialize weights
-    def initialize_weights(self, m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
-            m.bias.data.fill_(0.01)
-            m.weight.requires_grad = True
-            m.bias.requires_grad = True
-        elif isinstance(m, nn.Embedding):
-            torch.nn.init.normal_(m.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layers))
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        optimizer = fabric.setup_optimizers(optimizer)
+
+        # Create the learning rate scheduler.
+        #total_steps = train_len * num_epochs
+        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        #scheduler.load_state_dict(checkpoint["scheduler"])
+        return model, optimizer, self.iter_num
+        
 
     @torch.no_grad()
     def validate(self, fabric, model, validation_dataset):
@@ -174,14 +191,10 @@ class Model():
         with torch.no_grad():
             for i, batch in enumerate(validation_dataset):
                 input_ids, labels = fabric.to_device(batch)   
-
-                #labels = fabric.to_device(batch["labels"])
                 logits = model(input_ids, 0)
-                logits = logits.view(-1, logits.size(-1))
-                labels = labels.view(-1)
-                masked_label = labels[labels.nonzero().view(-1)].type(torch.cuda.LongTensor)
-                masked_logits = logits[labels.nonzero().view(-1), :]
-                loss = torch.nn.functional.cross_entropy(masked_logits, masked_label)
+
+                # Calculate the loss
+                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
 
                 losses += loss.item()
         out = losses / validation_len
@@ -192,42 +205,30 @@ class Model():
         fabric,
         model,
         optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler, 
         train_data,
         val_data,
-        stat_f):
+        stat_f,
+        is_sophia=False):
+
+        k = 10
+
+
+        model.train()
 
         # run epoches
-        while True:
-            
-            # TODO: add learning rate scheduling
-            model.train()
+        for epoch in range(self.iter_num, num_epochs):            
+          
             t0 = time.time()
             total_iter_loss = 0
             # run batches
-            #for i, batch in tqdm(enumerate(train_data), desc ="Epoch " + str(self.iter_num) + ": ", miniters = 100):
             for i, batch in enumerate(train_data):
-
                 input_ids, labels = fabric.to_device(batch)   
 
-                #labels = fabric.to_device(batch["labels"])
                 logits = model(input_ids, 0)
-                logits = logits.view(-1, logits.size(-1))
-                labels = labels.view(-1)
-                masked_label = labels[labels.nonzero().view(-1)].type(torch.cuda.LongTensor)
-                masked_logits = logits[labels.nonzero().view(-1), :]
-                loss = torch.nn.functional.cross_entropy(masked_logits, masked_label)
-                loss = Variable(loss, requires_grad = True)
 
-                total_iter_loss += loss.item()
-
-                # print and save log every log_interval iter
-                if i % log_interval == 0:
-                    elapsed = time.time() - t0
-                    log = '| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.4f} | {:5.4f} s/batch  | loss {:5.4f} | ppl {:8.2f}\n'.format(\
-                    self.iter_num, i+1, train_len , learning_rate, elapsed / log_interval, total_iter_loss/(i+1), math.exp(total_iter_loss/(i+1)))
-                    print(log)
-                    print(log, file=stat_f)
-
+                # Calculate the loss
+                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
                 fabric.backward(loss)
 
                 # Gradient clipping
@@ -235,27 +236,56 @@ class Model():
                     fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
 
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
+                total_iter_loss += loss.item()
+
+                # print and save log every log_interval iter
+                if i % log_interval == 0:
+                    elapsed = time.time() - t0
+                    log = '| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.8f} | {:5.4f} s/batch  | loss {:5.4f} | ppl {:8.2f}\n'.format(\
+                    self.iter_num, i+1, train_len , optimizer.param_groups[0]["lr"], elapsed / log_interval, total_iter_loss/(i+1), math.exp(total_iter_loss/(i+1)))
+                    print(log)
+                    print(log, file=stat_f)
+
+                if is_sophia and i % k == k - 1:
+                    logits = model(input_ids, 0)
+                    samp_dist = torch.distributions.Categorical(logits=logits)
+                    y_sample = samp_dist.sample()
+                    loss_sampled = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y_sample.view(-1), ignore_index=0)
+                    loss_sampled.backward()
+                    optimizer.update_hessian()
+                    optimizer.zero_grad(set_to_none=True)
+            
             epoch_loss = total_iter_loss / train_len
 
             dt = time.time() - t0
             
+            self.iter_num += 1
+
             # evaluate the loss on train/val sets at end of epoch and write checkpoints
             if self.iter_num > 0:
+            #if False:
                 val_loss = self.validate(fabric, model, val_data)
                 log = '| end of epoch {:3d} | time elapsed {:3f}s | \
                 valid loss {:5.2f} | valid ppl {:8.2f}\n | epoch loss {:5.4f} | epoch loss ppl {:5.2f}'.format(self.iter_num, dt, val_loss, \
                 np.exp(val_loss), epoch_loss, math.exp(epoch_loss))
                 print(log, file=stat_f)
                 fabric.print(log)
-                fabric.print(f"Saving checkpoint to {out_dir}")
-                self.save_model_checkpoint(fabric, model, optimizer)
+                fabric.print(f"Saving checkpoint to {self.path_training}")
+                self.save_model_checkpoint(fabric, model, optimizer, scheduler)
             
-            
-            self.iter_num += 1
             t0 = time.time()
             if self.iter_num > max_iters:
                 break
 
-main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-l','--load_iter_path', type=str, default="")
+    parser.add_argument('-o','--optimizer', type=str, default="adamw")
+    parser.add_argument('-n','--num_nodes', type=int, default=2)
+
+
+    args = parser.parse_args()
+    main(args)
 

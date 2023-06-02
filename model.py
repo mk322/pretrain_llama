@@ -125,12 +125,12 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        with torch.no_grad():
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
@@ -218,8 +218,15 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, ColumnParallelLinear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
+        elif isinstance(module, RowParallelLinear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
 
-    @torch.inference_mode()
+    #@torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
@@ -236,4 +243,5 @@ class Transformer(nn.Module):
         h = self.norm(h)
         # [batch_size, sequence_length, hidden_size]
         output = self.output(h[:, :, :])  # only compute last logits
+        #output = self.output(h).permute((0, 2, 1))        
         return output.float()
