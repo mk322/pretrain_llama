@@ -1,44 +1,38 @@
 import torch
-from torch.autograd import Variable
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 import lightning as L
 import numpy as np
 from lightning.fabric.strategies import FSDPStrategy
-from functools import partial
+from torch.distributed.fsdp import FullStateDictConfig
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType
 from sophia import SophiaG
+from functools import partial
 torch.set_float32_matmul_precision('high')
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from model import Transformer, ModelArgs, TransformerBlock  # Assuming model.py is in the same directory
 import os
 import time
-from tqdm.auto import tqdm
 import math
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 from preprocess_data import load_data
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-from datetime import datetime
 import argparse
 import numpy as np
 
-os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OMP_NUM_THREADS"] = "1"
 dim = 2048
 n_heads = 4
 n_layers = 4
 vocab_size = 32000
 log_interval = 20
 training_sample = 10000
-num_epochs = 10
+num_epochs = 4
 
 # Hyperparameters
-learning_rate = 6e-4
-batch_size = 64
-max_iters = 100
+learning_rate = 8e-4
+batch_size = 32
 weight_decay = 1e-1
-beta1 = 0.95
-beta2 = 0.9
+beta1 = 0.965
+beta2 = 0.99
 grad_clip = 1.0
 rho = 0.1
 
@@ -46,9 +40,9 @@ rho = 0.1
 train_data, valid_data, test_data, train_len, validation_len = load_data(batch_size, training_sample)
 
 def main(args):
-    path = f"{args.optimizer}_out_2/"
-    path_loss = f"{args.optimizer}_out_2/loss/"
-    path_training = f"{args.optimizer}_out_2/training/"
+    path = f"{args.optimizer}_out_5/"
+    path_loss = f"{args.optimizer}_out_5/loss/"
+    path_training = f"{args.optimizer}_out_5/training/"
     if not os.path.exists(path):
         os.mkdir(path)
     if not os.path.exists(path_loss):
@@ -69,13 +63,15 @@ def main(args):
 
     model_args = fabric.to_device(ModelArgs(dim=dim, n_layers=n_layers, n_heads=n_heads, vocab_size=vocab_size, max_batch_size=batch_size))  # Update these parameters as needed
     model = fabric.to_device(Transformer(model_args))
+    #print(model.parameters())
+    for name, param in model.named_parameters():
+        param.requires_grad = True
 
     # initialize a model/ start from checkpoint
-
     load_file_path = args.load_iter_path
     if load_file_path == "" or load_file_path=="pretrain":
         print("initial weight!!!")
-        model.apply(model._init_weights)
+        #model.apply(model._init_weights)
         model = fabric.setup_module(model)
         if args.optimizer == "sophia":
             optimizer = SophiaG(model.parameters(), lr=learning_rate, betas=(beta1, beta2), rho = 0.01, weight_decay=weight_decay)
@@ -91,14 +87,12 @@ def main(args):
     else:
         model, optimizer, iter = m.load_model_checkpoint(fabric, model, load_file_path, args.optimizer)
         m.file_cnt = iter
-    for param in model.parameters():
-        param.requires_grad = True
 
     # save initial weights
     m.save_model_checkpoint(fabric, model, optimizer)
 
-    total_steps = train_len * (num_epochs-m.iter_num)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    total_steps = train_len * (num_epochs - m.iter_num + 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=3e-4)
 
     filename = f"{path_loss}"+str(m.file_cnt)+".txt"
     stat_f = open(filename, "w", buffering=1)
@@ -112,7 +106,6 @@ def main(args):
     stat_f.write(f'vocab_size = {vocab_size}\n')
     #stat_f.write(f'epochs = {epochs}\n')
     stat_f.write(f'log_interval = {log_interval}\n')
-    stat_f.write(f'max_iters = {max_iters}\n')
     stat_f.write(f'batch_size = {batch_size}\n')
     stat_f.write(f'weight_decay = {weight_decay}\n')
     stat_f.write(f'beta1 = {beta1}\n')
@@ -149,19 +142,20 @@ class Model():
         return local_rank, world_size
 
     def save_model_checkpoint(self, fabric, model, optimizer):
-
         file_path = os.path.join(self.path_training, f"iter-{self.iter_num:06d}-ckpt.pth")
-        save_state = {"model": model, "optimizer": optimizer, "iter_num": self.iter_num}
-        fabric.save(file_path, save_state)
+        
+        if isinstance(fabric.strategy, FSDPStrategy):
+            save_policy = FullStateDictConfig(offload_to_cpu=(fabric.world_size > 1), rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = model._forward_module.state_dict()
+        else:
+            state_dict = model.state_dict()
+        
+        if fabric.global_rank == 0:
+            torch.save(state_dict, file_path)
+        fabric.barrier()
 
     def load_model_checkpoint(self, fabric, model, file_path, optim="adamw"):
-        # if not file_path.is_file():
-        #     print(f'model checkpoint {file_path} is not present. Returning...')
-        #     return
-        # checkpoint = torch.load(file_path)
-        # #integrate into loaded model
-        # model.load
-        # example: "out/training/iter-000004-ckpt.pth"
         index = file_path.find('iter-')
         self.iter_num = int(file_path[index+5:index+11])+1
         checkpoint = fabric.load(file_path)
@@ -174,13 +168,8 @@ class Model():
         else:
             raise Exception(f'{optim} is not a valid optimizer name, please try adamw or sophia.')
 
-        optimizer.load_state_dict(checkpoint["optimizer"])
         optimizer = fabric.setup_optimizers(optimizer)
 
-        # Create the learning rate scheduler.
-        #total_steps = train_len * num_epochs
-        #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-        #scheduler.load_state_dict(checkpoint["scheduler"])
         return model, optimizer, self.iter_num
         
 
@@ -190,7 +179,7 @@ class Model():
         losses = 0
         with torch.no_grad():
             for i, batch in enumerate(validation_dataset):
-                input_ids, labels = fabric.to_device(batch)   
+                input_ids, labels = fabric.to_device(batch)
                 logits = model(input_ids, 0)
 
                 # Calculate the loss
@@ -210,12 +199,9 @@ class Model():
         val_data,
         stat_f,
         is_sophia=False):
-
         k = 10
 
-
         model.train()
-
         # run epoches
         for epoch in range(self.iter_num, num_epochs):            
           
@@ -223,12 +209,13 @@ class Model():
             total_iter_loss = 0
             # run batches
             for i, batch in enumerate(train_data):
-                input_ids, labels = fabric.to_device(batch)   
+                input_ids, labels = fabric.to_device(batch)
 
                 logits = model(input_ids, 0)
 
                 # Calculate the loss
                 loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
+
                 fabric.backward(loss)
 
                 # Gradient clipping
@@ -244,7 +231,7 @@ class Model():
                 if i % log_interval == 0:
                     elapsed = time.time() - t0
                     log = '| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.8f} | {:5.4f} s/batch  | loss {:5.4f} | ppl {:8.2f}\n'.format(\
-                    self.iter_num, i+1, train_len , optimizer.param_groups[0]["lr"], elapsed / log_interval, total_iter_loss/(i+1), math.exp(total_iter_loss/(i+1)))
+                    self.iter_num, i+1, train_len , optimizer.param_groups[0]["lr"], elapsed / (i+1), total_iter_loss/(i+1), math.exp(total_iter_loss/(i+1)))
                     print(log)
                     print(log, file=stat_f)
 
@@ -264,20 +251,17 @@ class Model():
             self.iter_num += 1
 
             # evaluate the loss on train/val sets at end of epoch and write checkpoints
-            if self.iter_num > 0:
-            #if False:
-                val_loss = self.validate(fabric, model, val_data)
-                log = '| end of epoch {:3d} | time elapsed {:3f}s | \
-                valid loss {:5.2f} | valid ppl {:8.2f}\n | epoch loss {:5.4f} | epoch loss ppl {:5.2f}'.format(self.iter_num, dt, val_loss, \
-                np.exp(val_loss), epoch_loss, math.exp(epoch_loss))
-                print(log, file=stat_f)
-                fabric.print(log)
-                fabric.print(f"Saving checkpoint to {self.path_training}")
-                self.save_model_checkpoint(fabric, model, optimizer, scheduler)
+            fabric.print(f"Saving checkpoint to {self.path_training}")
+            self.save_model_checkpoint(fabric, model, optimizer)
+            val_loss = self.validate(fabric, model, val_data)
+            log = '| end of epoch {:3d} | time elapsed {:3f}s | \
+            valid loss {:5.2f} | valid ppl {:8.2f}\n | epoch loss {:5.4f} | epoch loss ppl {:5.2f}'.format(self.iter_num, dt, val_loss, \
+            np.exp(val_loss), epoch_loss, math.exp(epoch_loss))
+            print(log, file=stat_f)
+            fabric.print(log)
+
             
             t0 = time.time()
-            if self.iter_num > max_iters:
-                break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
