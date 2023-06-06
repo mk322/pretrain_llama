@@ -9,7 +9,7 @@ from model import Transformer
 
 class LLaMA:
     def __init__(self, model: Transformer, tokenizer):
-        self.model = model
+        self.model = model.to("cuda")
         self.tokenizer = tokenizer
 
     def generate(
@@ -19,7 +19,7 @@ class LLaMA:
         temperature: float = 0.8,
         top_p: float = 0.95,
     ) -> List[str]:
-        pad_id = 0
+        pad_id = -100
         bsz = len(prompts)
         params = self.model.params
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
@@ -31,16 +31,14 @@ class LLaMA:
 
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
 
-        tokens = torch.full((bsz, total_len), pad_id).cuda().long()
+        tokens = torch.full((bsz, total_len), pad_id).cuda().long().to("cuda")
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t).long()
+            tokens[k, : len(t)] = torch.tensor(t).long().to("cuda")
         input_text_mask = tokens != pad_id
         start_pos = min_prompt_size
         prev_pos = 0
         for cur_pos in range(start_pos, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-            logits = logits[:,-1,:]
-            # TODO: uncertain on its behavior
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)[:, -1, :]
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -59,10 +57,10 @@ class LLaMA:
             # cut to max gen len
             t = t[: len(prompt_tokens[i]) + max_gen_len]
             # cut to eos tok if any
-            # try:
-            #     t = t[: t.index(self.tokenizer.eos_id)]
-            # except ValueError:
-            #     pass
+            try:
+                t = t[: t.index(self.tokenizer.eos_token_id)]
+            except ValueError:
+                pass
             decoded.append(self.tokenizer.decode(t))
         return decoded
 
